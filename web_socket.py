@@ -8,20 +8,22 @@ from threading import Thread, Lock
 
 
 class SocketServer():
-    def __init__(self,port,q):
+    def __init__(self,port,q,outq,textqueue):
         self._port = port
-        _ChatSocketHandler.queue =q
+        _ChatSocketHandler.inqueue =q
+        _ChatSocketHandler.outqueue = outq
+        _ChatSocketHandler.textqueue = textqueue
 
     def __call__(self):
         app = _Application()
         app.listen(self._port)
         tornado.ioloop.IOLoop.current().start()
 
-
 class _Application(tornado.web.Application):
     def __init__(self):
         handlers = [
-            (r"/", _ChatSocketHandler)
+            (r"/", _ChatSocketHandler,dict(source='mobile')),
+            (r"/web", _ChatSocketHandler,dict(source='web'))
         ]
         settings = dict(
             xsrf_cookies=True,
@@ -29,12 +31,18 @@ class _Application(tornado.web.Application):
         super(_Application, self).__init__(handlers, **settings)
 
 class _ChatSocketHandler(tornado.websocket.WebSocketHandler):
-    queue = None
-    waiters = set()
+
+    inqueue = None
+    outqueue = None
+    textqueue = None
+    waiters_mobile = set()
+    waiters_web = set()
     cache = []
     cache_size = 200
     locker = Lock()
 
+    def initialize(self,source):
+        self.source = source
     def check_origin(self, origin):
         return True
 
@@ -44,13 +52,20 @@ class _ChatSocketHandler(tornado.websocket.WebSocketHandler):
 
     def open(self):
         _ChatSocketHandler.locker.acquire()
-        _ChatSocketHandler.waiters.add(self)
-        print("Connected");
+        if self.source == "mobile":
+            self.waiters_mobile.add(self)
+            print("Mobile Connected");
+        else:
+            self.waiters_web.add(self)
+            print("Web Connected");
         _ChatSocketHandler.locker.release()
 
     def on_close(self):
         _ChatSocketHandler.locker.acquire()
-        _ChatSocketHandler.waiters.remove(self)
+        if self.source == "mobile":
+            _ChatSocketHandler.waiters_mobile.remove(self)
+        else:
+            _ChatSocketHandler.waiters_web.remove(self)
         _ChatSocketHandler.locker.release()
 
     @classmethod
@@ -59,15 +74,39 @@ class _ChatSocketHandler(tornado.websocket.WebSocketHandler):
         if len(cls.cache) > cls.cache_size:
             cls.cache = cls.cache[-cls.cache_size:]
     @classmethod
-    def send(cls, chat):
+    def send_frame(cls, frame):
         _ChatSocketHandler.locker.acquire()
-        for waiter in cls.waiters:
+        cnt = cv2.imencode('.jpg', frame)[1]
+        str = base64.b64encode(cnt.ravel())
+        for waiter in cls.waiters_web:
             try:
-                waiter.write_message(chat)
+                waiter.write_message("data:image/jpg;base64," + str.decode('ascii'))
             except:
                 pass
         _ChatSocketHandler.locker.release()
 
+    @classmethod
+    def send_text(cls, text):
+        _ChatSocketHandler.locker.acquire()
+        for waiter in cls.waiters_mobile:
+            try:
+                waiter.write_message(text)
+            except:
+                pass
+        _ChatSocketHandler.locker.release()
     def on_message(self, message):
-        if _ChatSocketHandler.queue:
-            _ChatSocketHandler.queue.put(message)
+        if _ChatSocketHandler.inqueue:
+            _ChatSocketHandler.inqueue.put(message)
+            try:
+                toweb = _ChatSocketHandler.outqueue.get(False)
+                if toweb is not None:
+                    _ChatSocketHandler.send_frame(toweb)
+            except:
+                pass
+
+            try:
+                text_to_mobile = _ChatSocketHandler.textqueue.get(False)
+                if text_to_mobile is not None:
+                    _ChatSocketHandler.send_text(text_to_mobile)
+            except:
+                pass
